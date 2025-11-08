@@ -3,8 +3,8 @@
 # shellcheck disable=SC2086
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
-confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
+confhome=https://raw.githubusercontent.com/foundergpi/gpireinstall/main
+confhome_cn=https://cnb.cool/foundergpi/gpireinstall/-/git/raw/main
 # confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
@@ -126,6 +126,106 @@ echo_color_text() {
 error_and_exit() {
     error "$@"
     exit 1
+}
+
+# Function to modify Windows password in DD image via startup script
+modify_windows_password_dd() {
+    local img_file="$1"
+    local password="$2"
+    
+    if [ -z "$password" ] || [ -z "$img_file" ]; then
+        return 0
+    fi
+    
+    echo "[DD Password] Injecting password modification script to image..."
+    
+    # Install required tools
+    if ! command -v kpartx &> /dev/null; then
+        echo "[DD Password] Installing kpartx..."
+        apt-get update -qq && apt-get install -y -qq kpartx || return 1
+    fi
+    if ! command -v ntfs-3g &> /dev/null; then
+        echo "[DD Password] Installing ntfs-3g..."
+        apt-get install -y -qq ntfs-3g || return 1
+    fi
+    
+    # Extract image temporarily if .gz
+    local temp_img="$img_file"
+    local need_cleanup=false
+    
+    if [[ "$img_file" == *.gz ]]; then
+        temp_img="/tmp/dd_image_$$"
+        echo "[DD Password] Extracting image temporarily..."
+        gunzip -c "$img_file" > "$temp_img" || return 1
+        need_cleanup=true
+    fi
+    
+    # Setup loop device
+    local loop_dev=$(losetup -f --show "$temp_img" 2>/dev/null) || {
+        echo "[DD Password] Warning: Failed to setup loop device"
+        [ "$need_cleanup" = true ] && rm -f "$temp_img"
+        return 1
+    }
+    
+    # Map partitions
+    kpartx -av "$loop_dev" >/dev/null 2>&1
+    
+    # Find Windows partition
+    local mount_point="/mnt/windows_dd_$$"
+    mkdir -p "$mount_point"
+    local mounted=false
+    
+    # Try to mount partitions
+    for part in /dev/mapper/$(basename $loop_dev)*; do
+        [ -b "$part" ] || continue
+        if mount -t ntfs-3g "$part" "$mount_point" 2>/dev/null; then
+            if [ -d "$mount_point/Windows/System32" ]; then
+                mounted=true
+                break
+            fi
+            umount "$mount_point" 2>/dev/null
+        fi
+    done
+    
+    # If partition mapping failed, try direct mount
+    if [ "$mounted" = false ]; then
+        if mount -t ntfs-3g "$loop_dev" "$mount_point" 2>/dev/null; then
+            if [ -d "$mount_point/Windows/System32" ]; then
+                mounted=true
+            else
+                umount "$mount_point" 2>/dev/null
+            fi
+        fi
+    fi
+    
+    if [ "$mounted" = true ]; then
+        # Create startup script directory
+        mkdir -p "$mount_point/Windows/Setup/Scripts"
+        
+        # Create password reset script
+        cat > "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd" <<'EOF'
+@echo off
+timeout /t 60 /nobreak >nul
+net user Administrator "PASSWORD_PLACEHOLDER" >nul 2>&1
+net user Administrator /active:yes >nul 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul 2>&1
+del "%~f0" >nul 2>&1
+EOF
+        # Replace password placeholder
+        sed -i "s/PASSWORD_PLACEHOLDER/$password/g" "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd"
+        
+        sync
+        umount "$mount_point"
+        echo "[DD Password] Password script injected successfully!"
+    else
+        echo "[DD Password] Warning: Could not mount Windows partition"
+    fi
+    
+    # Cleanup
+    kpartx -d "$loop_dev" >/dev/null 2>&1
+    losetup -d "$loop_dev" >/dev/null 2>&1
+    rmdir "$mount_point" 2>/dev/null
+    [ "$need_cleanup" = true ] && rm -f "$temp_img"
 }
 
 show_dd_password_tips() {
@@ -4273,6 +4373,12 @@ else
     alpine_ver_for_trans=$(get_latest_distro_releasever alpine)
     setos finalos $distro $releasever
     setos nextos alpine $alpine_ver_for_trans
+fi
+
+# Modify Windows password for DD mode if password provided
+if is_use_dd && [ -n "$password" ] && [ -n "$img" ]; then
+    info "Modifying Windows password in DD image..."
+    modify_windows_password_dd "$img" "$password"
 fi
 
 # 删除之前的条目
