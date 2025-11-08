@@ -132,6 +132,7 @@ error_and_exit() {
 modify_windows_password_dd() {
     local img_file="$1"
     local password="$2"
+    local original_img="$img_file"  # Save original for cleanup
     
     if [ -z "$password" ] || [ -z "$img_file" ]; then
         return 0
@@ -149,14 +150,33 @@ modify_windows_password_dd() {
         apt-get install -y -qq ntfs-3g || return 1
     fi
     
-    # Extract image temporarily if .gz
+    # Download image if URL, then extract if .gz
     local temp_img="$img_file"
+    local downloaded_file=""
     local need_cleanup=false
     
+    # Check if it's a URL
+    if [[ "$img_file" =~ ^https?:// ]] || [[ "$img_file" =~ ^magnet: ]]; then
+        echo "[DD Password] Downloading image from URL..."
+        downloaded_file="/tmp/dd_image_$$.gz"
+        curl -L -o "$downloaded_file" "$img_file" || {
+            echo "[DD Password] Error: Failed to download image"
+            return 1
+        }
+        need_cleanup=true
+        img_file="$downloaded_file"
+    fi
+    
+    # Extract image temporarily if .gz
     if [[ "$img_file" == *.gz ]]; then
-        temp_img="/tmp/dd_image_$$"
+        local extracted_img="/tmp/dd_image_$$"
         echo "[DD Password] Extracting image temporarily..."
-        gunzip -c "$img_file" > "$temp_img" || return 1
+        gunzip -c "$img_file" > "$extracted_img" || {
+            echo "[DD Password] Error: Failed to extract image"
+            [ "$need_cleanup" = true ] && rm -f "$temp_img"
+            return 1
+        }
+        temp_img="$extracted_img"
         need_cleanup=true
     fi
     
@@ -225,7 +245,14 @@ EOF
     kpartx -d "$loop_dev" >/dev/null 2>&1
     losetup -d "$loop_dev" >/dev/null 2>&1
     rmdir "$mount_point" 2>/dev/null
-    [ "$need_cleanup" = true ] && rm -f "$temp_img"
+    if [ "$need_cleanup" = true ]; then
+        # Remove extracted image
+        rm -f "$temp_img"
+        # If we downloaded from URL, also remove the downloaded .gz file
+        if [ -n "$downloaded_file" ] && [ -f "$downloaded_file" ]; then
+            rm -f "$downloaded_file"
+        fi
+    fi
 }
 
 show_dd_password_tips() {
