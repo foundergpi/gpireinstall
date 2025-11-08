@@ -407,7 +407,16 @@ extract_env_from_cmdline() {
             if [ -n "$line" ]; then
                 key=$(echo $line | cut -d= -f1)
                 value=$(echo $line | cut -d= -f2-)
+                # Debug: Log password extraction specifically
+                if [ "$key" = "password" ]; then
+                    info "DEBUG: Extracting password from cmdline: key=$key, value_length=${#value}"
+                fi
                 eval "$key='$value'"
+                # Debug: Verify password after eval
+                if [ "$key" = "password" ]; then
+                    eval "extracted_password=\$$key"
+                    info "DEBUG: Password after eval: length=${#extracted_password}, value='$extracted_password'"
+                fi
             fi
         done < <(xargs -n1 </proc/cmdline | grep "^${prefix}_" | sed "s/^${prefix}_//")
     done
@@ -2975,6 +2984,10 @@ get_image_state() {
 modify_windows() {
     os_dir=$1
     info "Modify Windows"
+    
+    # Debug: Show all password-related variables
+    info "DEBUG: password variable = '${password:-NOT SET}'"
+    info "DEBUG: extra_password from cmdline = '$(xargs -n1 </proc/cmdline | grep '^extra_password=' | cut -d= -f2- || echo 'NOT FOUND')'"
 
     # https://learn.microsoft.com/windows-hardware/manufacture/desktop/windows-setup-states
     # https://learn.microsoft.com/troubleshoot/azure/virtual-machines/reset-local-password-without-agent
@@ -3000,15 +3013,27 @@ modify_windows() {
     fi
 
     # 1.5. 修改密码
+    info "===== PASSWORD CHECK START ====="
     info "Checking password: password variable is '${password:-empty}'"
+    info "is_need_change_password check: $([ -n "$password" ] && echo 'TRUE' || echo 'FALSE')"
+    
     if is_need_change_password; then
         info "Password provided, creating password change script..."
+        info "Password value: '${password}'"
+        info "Password length: ${#password}"
         create_win_change_password_script $os_dir/windows-change-password.bat "$password"
-        bats="$bats windows-change-password.bat"
-        info "Password script created and added to bats list"
+        if [ -f "$os_dir/windows-change-password.bat" ]; then
+            info "Password script file created successfully: $os_dir/windows-change-password.bat"
+            bats="$bats windows-change-password.bat"
+            info "Password script added to bats list. Current bats: $bats"
+        else
+            error "Password script file NOT created! Path: $os_dir/windows-change-password.bat"
+        fi
     else
         warn "No password provided or password is empty, skipping password change script"
+        warn "Password check failed. Variable 'password' is: '${password:-undefined}'"
     fi
+    info "===== PASSWORD CHECK END ====="
 
     # 2. 允许 ping
     if is_allow_ping; then
@@ -7326,6 +7351,14 @@ rm -f /etc/runlevels/default/local
 
 # 提取变量
 extract_env_from_cmdline
+
+# Debug: Show password after extraction
+info "DEBUG: After extract_env_from_cmdline, password = '${password:-NOT SET}'"
+if [ -n "$password" ]; then
+    info "DEBUG: Password length = ${#password}"
+else
+    warn "DEBUG: Password is empty or not set!"
+fi
 
 # 带参数运行部分
 # 重新下载并 exec 运行新脚本
