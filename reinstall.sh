@@ -248,30 +248,32 @@ modify_windows_password_dd() {
             fi
         fi
         
+        # Create startup script directory
         if [ "$mounted" = true ]; then
-            # Create startup script directory
-            mkdir -p "$mount_point/Windows/Setup/Scripts" || {
+            if ! mkdir -p "$mount_point/Windows/Setup/Scripts" 2>/dev/null; then
                 echo "[DD Password] Error: Cannot create directory (filesystem may be read-only or corrupted)"
                 echo "[DD Password] Trying to remount with force option..."
                 umount "$mount_point" 2>/dev/null
                 # Try with force option
+                local remounted=false
                 for part in /dev/mapper/$(basename $loop_dev)*; do
                     [ -b "$part" ] || continue
                     if mount -t ntfs-3g -o rw,force "$part" "$mount_point" 2>/dev/null; then
                         if [ -d "$mount_point/Windows/System32" ]; then
-                            mkdir -p "$mount_point/Windows/Setup/Scripts" || {
-                                echo "[DD Password] Error: Still cannot create directory"
-                                umount "$mount_point" 2>/dev/null
-                                mounted=false
-                            }
-                            break
+                            if mkdir -p "$mount_point/Windows/Setup/Scripts" 2>/dev/null; then
+                                remounted=true
+                                mounted=true
+                                break
+                            fi
+                            umount "$mount_point" 2>/dev/null
                         fi
                         umount "$mount_point" 2>/dev/null
                     fi
                 done
-                if [ "$mounted" = false ]; then
+                if [ "$remounted" = false ]; then
                     echo "[DD Password] Warning: Cannot modify image (read-only filesystem)"
                     echo "[DD Password] Password will not be modified. You may need to reset password manually after install."
+                    mounted=false
                 fi
             fi
         fi
