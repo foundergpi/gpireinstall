@@ -378,11 +378,47 @@ test_url_real() {
     # 过滤 curl 23 错误（head 限制了大小）
     # 也可用 ulimit -f 但好像 cygwin 不支持
     # ${PIPESTATUS[n]} 表示第n个管道的返回值
+    
+    # Check available disk space before download
+    available_space=$(df -B1 "$tmp" 2>/dev/null | tail -1 | awk '{print $4}' || echo "0")
+    # Need at least 2MB free space
+    if [ "$available_space" -lt 2097152 ]; then
+        if $grace; then
+            warn "Not enough disk space to test URL. Skipping file type test."
+            return 1
+        else
+            error_and_exit "Not enough disk space to test URL. Need at least 2MB free space."
+        fi
+    fi
+    
     echo $url
     for i in $(seq 5 -1 0); do
+        # Try to download with error handling for disk space
         if command curl --insecure --connect-timeout 10 -Lfr 0-1048575 "$url" \
-            1> >(exec head -c 1048576 >$tmp_file) \
+            1> >(exec head -c 1048576 >$tmp_file 2>/dev/null || {
+                if [ $? -eq 1 ] && [ ! -f "$tmp_file" ]; then
+                    # Disk space error
+                    if $grace; then
+                        return 1
+                    else
+                        error_and_exit "Not enough disk space to download test file."
+                    fi
+                fi
+            }) \
             2> >(exec grep -v 'curl: (23)' >&2); then
+            # Check if file was created successfully
+            if [ ! -f "$tmp_file" ] || [ ! -s "$tmp_file" ]; then
+                if [ $i -eq 0 ]; then
+                    if $grace; then
+                        return 1
+                    else
+                        failed "$url not accessible or disk full"
+                        return 1
+                    fi
+                fi
+                sleep 1
+                continue
+            fi
             break
         else
             ret=$?
@@ -409,6 +445,15 @@ test_url_real() {
             sleep 1
         fi
     done
+    
+    # Check if file exists and has content
+    if [ ! -f "$tmp_file" ] || [ ! -s "$tmp_file" ]; then
+        if $grace; then
+            return 1
+        else
+            error_and_exit "Failed to download test file from $url"
+        fi
+    fi
 
     # 如果要检查文件类型
     if [ -n "$expect_types" ]; then
@@ -495,14 +540,41 @@ file_enhanced() {
         case "$type" in
         xz | gzip | zstd)
             install_pkg "$type"
-            $type -dc <"$file" | head -c 1048576 >"$file.inside"
-            mv -f "$file.inside" "$file"
+            # Check available disk space before extracting
+            available_space=$(df -B1 "$(dirname "$file")" | tail -1 | awk '{print $4}')
+            # Need at least 2MB free space
+            if [ "$available_space" -lt 2097152 ]; then
+                warn "Not enough disk space to test file type. Assuming compressed format."
+                # Return the type we detected so far, assuming it's compressed
+                break
+            fi
+            $type -dc <"$file" | head -c 1048576 >"$file.inside" 2>/dev/null || {
+                warn "Failed to extract for type detection (possibly out of space). Using detected type: $type"
+                break
+            }
+            mv -f "$file.inside" "$file" 2>/dev/null || {
+                warn "Failed to move extracted file. Using detected type: $type"
+                break
+            }
             ;;
         tar)
             install_pkg "$type"
+            # Check available disk space before extracting
+            available_space=$(df -B1 "$(dirname "$file")" | tail -1 | awk '{print $4}')
+            # Need at least 2MB free space
+            if [ "$available_space" -lt 2097152 ]; then
+                warn "Not enough disk space to test file type. Assuming tar format."
+                break
+            fi
             # 隐藏 gzip: unexpected end of file 提醒
-            tar xf "$file" -O 2>/dev/null | head -c 1048576 >"$file.inside"
-            mv -f "$file.inside" "$file"
+            tar xf "$file" -O 2>/dev/null | head -c 1048576 >"$file.inside" 2>/dev/null || {
+                warn "Failed to extract tar for type detection. Using detected type: $type"
+                break
+            }
+            mv -f "$file.inside" "$file" 2>/dev/null || {
+                warn "Failed to move extracted file. Using detected type: $type"
+                break
+            }
             ;;
         *)
             break
@@ -1588,7 +1660,23 @@ The current machine is $basearch, but it seems the ISO is for $iso_arch. Continu
     # shellcheck disable=SC2154
     setos_dd() {
         # raw 包含 vhd
-        test_url $img 'raw raw.gzip raw.xz raw.zstd raw.tar.gzip raw.tar.xz raw.tar.zstd' img_type
+        # Try to test URL, but continue even if test fails due to disk space
+        if ! test_url_grace $img 'raw raw.gzip raw.xz raw.zstd raw.tar.gzip raw.tar.xz raw.tar.zstd' img_type; then
+            # If test fails (possibly due to disk space), assume it's gzip format based on URL
+            if [[ "$img" == *.gz ]]; then
+                img_type=raw.gzip
+                warn "File type test failed (possibly out of space). Assuming raw.gzip format based on URL."
+            elif [[ "$img" == *.xz ]]; then
+                img_type=raw.xz
+                warn "File type test failed (possibly out of space). Assuming raw.xz format based on URL."
+            elif [[ "$img" == *.zst ]] || [[ "$img" == *.zstd ]]; then
+                img_type=raw.zstd
+                warn "File type test failed (possibly out of space). Assuming raw.zstd format based on URL."
+            else
+                img_type=raw.gzip
+                warn "File type test failed (possibly out of space). Defaulting to raw.gzip format."
+            fi
+        fi
 
         if is_efi; then
             install_pkg hexdump
