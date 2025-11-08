@@ -195,10 +195,10 @@ modify_windows_password_dd() {
     mkdir -p "$mount_point"
     local mounted=false
     
-    # Try to mount partitions
+    # Try to mount partitions with read-write option
     for part in /dev/mapper/$(basename $loop_dev)*; do
         [ -b "$part" ] || continue
-        if mount -t ntfs-3g "$part" "$mount_point" 2>/dev/null; then
+        if mount -t ntfs-3g -o rw "$part" "$mount_point" 2>/dev/null; then
             if [ -d "$mount_point/Windows/System32" ]; then
                 mounted=true
                 break
@@ -207,9 +207,9 @@ modify_windows_password_dd() {
         fi
     done
     
-    # If partition mapping failed, try direct mount
+    # If partition mapping failed, try direct mount with read-write
     if [ "$mounted" = false ]; then
-        if mount -t ntfs-3g "$loop_dev" "$mount_point" 2>/dev/null; then
+        if mount -t ntfs-3g -o rw "$loop_dev" "$mount_point" 2>/dev/null; then
             if [ -d "$mount_point/Windows/System32" ]; then
                 mounted=true
             else
@@ -219,8 +219,65 @@ modify_windows_password_dd() {
     fi
     
     if [ "$mounted" = true ]; then
-        # Create startup script directory
-        mkdir -p "$mount_point/Windows/Setup/Scripts"
+        # Verify mount is read-write, remount if needed
+        if mount | grep -q "$mount_point.*ro,"; then
+            echo "[DD Password] Filesystem mounted read-only, remounting as read-write..."
+            umount "$mount_point" 2>/dev/null
+            # Try to remount the partition we found
+            for part in /dev/mapper/$(basename $loop_dev)*; do
+                [ -b "$part" ] || continue
+                if mount -t ntfs-3g -o rw,remove_hiberfile "$part" "$mount_point" 2>/dev/null; then
+                    if [ -d "$mount_point/Windows/System32" ]; then
+                        echo "[DD Password] Remounted as read-write successfully"
+                        mounted=true
+                        break
+                    fi
+                    umount "$mount_point" 2>/dev/null
+                fi
+            done
+            # If still not mounted, try direct mount
+            if [ "$mounted" = false ]; then
+                if mount -t ntfs-3g -o rw,remove_hiberfile "$loop_dev" "$mount_point" 2>/dev/null; then
+                    if [ -d "$mount_point/Windows/System32" ]; then
+                        echo "[DD Password] Remounted as read-write successfully"
+                        mounted=true
+                    else
+                        umount "$mount_point" 2>/dev/null
+                    fi
+                fi
+            fi
+        fi
+        
+        if [ "$mounted" = true ]; then
+            # Create startup script directory
+            mkdir -p "$mount_point/Windows/Setup/Scripts" || {
+                echo "[DD Password] Error: Cannot create directory (filesystem may be read-only or corrupted)"
+                echo "[DD Password] Trying to remount with force option..."
+                umount "$mount_point" 2>/dev/null
+                # Try with force option
+                for part in /dev/mapper/$(basename $loop_dev)*; do
+                    [ -b "$part" ] || continue
+                    if mount -t ntfs-3g -o rw,force "$part" "$mount_point" 2>/dev/null; then
+                        if [ -d "$mount_point/Windows/System32" ]; then
+                            mkdir -p "$mount_point/Windows/Setup/Scripts" || {
+                                echo "[DD Password] Error: Still cannot create directory"
+                                umount "$mount_point" 2>/dev/null
+                                mounted=false
+                            }
+                            break
+                        fi
+                        umount "$mount_point" 2>/dev/null
+                    fi
+                done
+                if [ "$mounted" = false ]; then
+                    echo "[DD Password] Warning: Cannot modify image (read-only filesystem)"
+                    echo "[DD Password] Password will not be modified. You may need to reset password manually after install."
+                fi
+            fi
+        fi
+    fi
+    
+    if [ "$mounted" = true ]; then
         
         # Create password reset script
         cat > "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd" <<'EOF'
