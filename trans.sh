@@ -3097,9 +3097,13 @@ EOF
             bat_source="$os_dir/$bat"
             bat_target="$os_dir/$bat_filename"
             
-            if [ -f "$bat_source" ]; then
+            # Hanya copy jika source dan target berbeda (untuk file di subdirectory)
+            if [ -f "$bat_source" ] && [ "$bat_source" != "$bat_target" ]; then
                 info "Copying $bat to root drive: $bat_target"
                 cp -f "$bat_source" "$bat_target"
+            elif [ -f "$bat_source" ]; then
+                # File sudah di root, tidak perlu copy
+                info "Script $bat already at root drive: $bat_source"
             else
                 warn "Script $bat not found at $bat_source, skipping copy"
             fi
@@ -3129,9 +3133,13 @@ EOF
             bat_source="$os_dir/$bat"
             bat_target="$os_dir/$bat_filename"
             
-            if [ -f "$bat_source" ]; then
+            # Hanya copy jika source dan target berbeda (untuk file di subdirectory)
+            if [ -f "$bat_source" ] && [ "$bat_source" != "$bat_target" ]; then
                 info "Copying $bat to root drive: $bat_target"
                 cp -f "$bat_source" "$bat_target"
+            elif [ -f "$bat_source" ]; then
+                # File sudah di root, tidak perlu copy
+                info "Script $bat already at root drive: $bat_source"
             else
                 warn "Script $bat not found at $bat_source, skipping copy"
             fi
