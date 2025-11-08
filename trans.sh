@@ -3000,9 +3000,14 @@ modify_windows() {
     fi
 
     # 1.5. 修改密码
+    info "Checking password: password variable is '${password:-empty}'"
     if is_need_change_password; then
+        info "Password provided, creating password change script..."
         create_win_change_password_script $os_dir/windows-change-password.bat "$password"
         bats="$bats windows-change-password.bat"
+        info "Password script created and added to bats list"
+    else
+        warn "No password provided or password is empty, skipping password change script"
     fi
 
     # 2. 允许 ping
@@ -3082,7 +3087,25 @@ EOF
         fi
 
         bats="$bats windows-del-gpo.bat"
+        
+        # 复制 bat 文件到根目录 (C:\)
+        # Script harus ada di root drive agar bisa dipanggil dari GPO
+        # $os_dir adalah mount point Windows, jadi $os_dir/ sudah adalah root drive (C:\)
         for bat in $bats; do
+            # 如果 bat 在 subdirectory (如 frpc\frpc.bat), 只取 filename untuk root drive
+            bat_filename=$(basename "$bat")
+            bat_source="$os_dir/$bat"
+            bat_target="$os_dir/$bat_filename"
+            
+            if [ -f "$bat_source" ]; then
+                info "Copying $bat to root drive: $bat_target"
+                cp -f "$bat_source" "$bat_target"
+            else
+                warn "Script $bat not found at $bat_source, skipping copy"
+            fi
+            
+            # GPO menggunakan full path jika ada subdirectory, tapi untuk root drive gunakan filename saja
+            # Jika bat ada subdirectory, tetap gunakan full path di GPO, tapi file juga di-copy ke root
             echo "${num}CmdLine=%SystemDrive%\\$bat" >>$scripts_ini
             echo "${num}Parameters=" >>$scripts_ini
             num=$((num + 1))
@@ -3097,11 +3120,30 @@ EOF
         setup_complete=$(get_path_in_correct_case $os_dir/Windows/Setup/Scripts/SetupComplete.cmd)
         mkdir -p "$(dirname $setup_complete)"
 
+        # 复制 bat 文件到根目录 (C:\)
+        # Script harus ada di root drive agar bisa dipanggil dari SetupComplete.cmd
+        # $os_dir adalah mount point Windows, jadi $os_dir/ sudah adalah root drive (C:\)
+        for bat in $bats; do
+            # 如果 bat 在 subdirectory (如 frpc\frpc.bat), 只取 filename untuk root drive
+            bat_filename=$(basename "$bat")
+            bat_source="$os_dir/$bat"
+            bat_target="$os_dir/$bat_filename"
+            
+            if [ -f "$bat_source" ]; then
+                info "Copying $bat to root drive: $bat_target"
+                cp -f "$bat_source" "$bat_target"
+            else
+                warn "Script $bat not found at $bat_source, skipping copy"
+            fi
+        done
+
         # 添加到 C:\Setup\Scripts\SetupComplete.cmd 最前面
         # call 防止子 bat 删除自身后中断主脚本
         setup_complete_mod=$(mktemp)
         for bat in $bats; do
-            echo "if exist %SystemDrive%\\$bat (call %SystemDrive%\\$bat)" >>$setup_complete_mod
+            # 只取 filename, 忽略 subdirectory
+            bat_filename=$(basename "$bat")
+            echo "if exist %SystemDrive%\\$bat_filename (call %SystemDrive%\\$bat_filename)" >>$setup_complete_mod
         done
 
         # 复制原来的内容
@@ -5437,16 +5479,40 @@ create_win_change_password_script() {
     password=$2
 
     info "Create win change password script"
+    info "Target: $target"
+    info "Password length: ${#password}"
+
+    if [ -z "$password" ]; then
+        error "Password is empty, cannot create script"
+        return 1
+    fi
 
     cat >$target <<EOF
 @echo off
-timeout /t 60 /nobreak >nul
+echo [Password Script] Starting password change...
+timeout /t 30 /nobreak >nul
+echo [Password Script] Changing Administrator password...
 net user Administrator "$password" >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [Password Script] Password changed successfully
+) else (
+    echo [Password Script] Failed to change password, error code: %errorlevel%
+)
 net user Administrator /active:yes >nul 2>&1
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul 2>&1
+echo [Password Script] Cleaning up...
 del "%~f0" >nul 2>&1
 EOF
     unix2dos $target
+    
+    if [ -f "$target" ]; then
+        info "Password script created successfully at $target"
+        # Show first few lines for debugging
+        head -3 "$target" | info "Script preview:"
+    else
+        error "Failed to create password script at $target"
+        return 1
+    fi
 }
 
 # virt-what 要用最新版
