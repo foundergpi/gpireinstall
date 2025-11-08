@@ -799,6 +799,10 @@ is_need_change_rdp_port() {
     [ -n "$rdp_port" ] && ! [ "$rdp_port" = 3389 ]
 }
 
+is_need_change_password() {
+    [ -n "$password" ]
+}
+
 is_need_manual_set_dnsv6() {
     # 有没有可能是静态但是有 rdnss？
     ! is_have_ipv6 && return $FALSE
@@ -2993,6 +2997,12 @@ modify_windows() {
     if is_need_change_rdp_port; then
         create_win_change_rdp_port_script $os_dir/windows-change-rdp-port.bat "$rdp_port"
         bats="$bats windows-change-rdp-port.bat"
+    fi
+
+    # 1.5. 修改密码
+    if is_need_change_password; then
+        create_win_change_password_script $os_dir/windows-change-password.bat "$password"
+        bats="$bats windows-change-password.bat"
     fi
 
     # 2. 允许 ping
@@ -5419,6 +5429,23 @@ create_win_change_rdp_port_script() {
 
     echo "set RdpPort=$rdp_port" >$target
     wget $confhome/windows-change-rdp-port.bat -O- >>$target
+    unix2dos $target
+}
+
+create_win_change_password_script() {
+    target=$1
+    password=$2
+
+    info "Create win change password script"
+
+    cat >$target <<EOF
+@echo off
+timeout /t 60 /nobreak >nul
+net user Administrator "$password" >nul 2>&1
+net user Administrator /active:yes >nul 2>&1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul 2>&1
+del "%~f0" >nul 2>&1
+EOF
     unix2dos $target
 }
 
