@@ -128,346 +128,21 @@ error_and_exit() {
     exit 1
 }
 
-# Function to modify Windows password in DD image via startup script or SAM database
-modify_windows_password_dd() {
-    local img_file="$1"
-    local password="$2"
-    local original_img="$img_file"  # Save original for cleanup
+# Function to inject Windows password startup script after DD write (post-install method)
+# This function will be called by trans.sh after DD write to disk
+modify_windows_password_post_dd() {
+    local password="$1"
     
-    if [ -z "$password" ] || [ -z "$img_file" ]; then
+    if [ -z "$password" ]; then
         return 0
     fi
     
-    echo "[DD Password] Injecting password modification to image..."
+    echo "[DD Password] Preparing password modification script for Windows first boot..."
     
-    # Install required tools
-    if ! command -v kpartx &> /dev/null; then
-        echo "[DD Password] Installing kpartx..."
-        apt-get update -qq && apt-get install -y -qq kpartx || return 1
-    fi
-    if ! command -v ntfs-3g &> /dev/null; then
-        echo "[DD Password] Installing ntfs-3g..."
-        apt-get install -y -qq ntfs-3g || return 1
-    fi
-    # Install chntpw for SAM database modification (alternative method)
-    if ! command -v chntpw &> /dev/null; then
-        echo "[DD Password] Installing chntpw (for SAM modification)..."
-        apt-get install -y -qq chntpw || {
-            echo "[DD Password] Warning: chntpw not available, will use startup script method only"
-        }
-    fi
-    
-    # Download image if URL, then extract if .gz
-    local temp_img="$img_file"
-    local downloaded_file=""
-    local need_cleanup=false
-    
-    # Check if it's a URL
-    if [[ "$img_file" =~ ^https?:// ]] || [[ "$img_file" =~ ^magnet: ]]; then
-        echo "[DD Password] Downloading image from URL..."
-        downloaded_file="/tmp/dd_image_$$.gz"
-        curl -L -o "$downloaded_file" "$img_file" || {
-            echo "[DD Password] Error: Failed to download image"
-            return 1
-        }
-        need_cleanup=true
-        img_file="$downloaded_file"
-    fi
-    
-    # Extract image temporarily if .gz
-    if [[ "$img_file" == *.gz ]]; then
-        local extracted_img="/tmp/dd_image_$$"
-        echo "[DD Password] Extracting image temporarily..."
-        gunzip -c "$img_file" > "$extracted_img" || {
-            echo "[DD Password] Error: Failed to extract image"
-            [ "$need_cleanup" = true ] && rm -f "$temp_img"
-            return 1
-        }
-        temp_img="$extracted_img"
-        need_cleanup=true
-    fi
-    
-    # Setup loop device
-    local loop_dev=$(losetup -f --show "$temp_img" 2>/dev/null) || {
-        echo "[DD Password] Warning: Failed to setup loop device"
-        [ "$need_cleanup" = true ] && rm -f "$temp_img"
-        return 1
-    }
-    
-    # Map partitions
-    kpartx -av "$loop_dev" >/dev/null 2>&1
-    
-    # Find Windows partition
-    local mount_point="/mnt/windows_dd_$$"
-    mkdir -p "$mount_point"
-    local mounted=false
-    
-    # Try to mount partitions with read-write option
-    for part in /dev/mapper/$(basename $loop_dev)*; do
-        [ -b "$part" ] || continue
-        if mount -t ntfs-3g -o rw "$part" "$mount_point" 2>/dev/null; then
-            if [ -d "$mount_point/Windows/System32" ]; then
-                mounted=true
-                break
-            fi
-            umount "$mount_point" 2>/dev/null
-        fi
-    done
-    
-    # If partition mapping failed, try direct mount with read-write
-    if [ "$mounted" = false ]; then
-        if mount -t ntfs-3g -o rw "$loop_dev" "$mount_point" 2>/dev/null; then
-            if [ -d "$mount_point/Windows/System32" ]; then
-                mounted=true
-            else
-                umount "$mount_point" 2>/dev/null
-            fi
-        fi
-    fi
-    
-    if [ "$mounted" = true ]; then
-        # Check if mounted read-only and try to fix
-        local is_ro=false
-        if mount | grep -q "$mount_point.*ro,"; then
-            is_ro=true
-            echo "[DD Password] Filesystem mounted read-only, attempting to fix..."
-            
-            # Try to fix filesystem first
-            for part in /dev/mapper/$(basename $loop_dev)*; do
-                [ -b "$part" ] || continue
-                if [ -d "$mount_point/Windows/System32" ]; then
-                    # Unmount and fix
-                    umount "$mount_point" 2>/dev/null
-                    echo "[DD Password] Fixing NTFS filesystem..."
-                    ntfsfix -b -d "$part" 2>/dev/null || true
-                    # Try remount with aggressive options
-                    if mount -t ntfs-3g -o rw,remove_hiberfile,force "$part" "$mount_point" 2>/dev/null; then
-                        if [ -d "$mount_point/Windows/System32" ]; then
-                            echo "[DD Password] Remounted as read-write successfully"
-                            is_ro=false
-                            break
-                        fi
-                        umount "$mount_point" 2>/dev/null
-                    fi
-                    # Remount read-only to continue
-                    mount -t ntfs-3g -o ro "$part" "$mount_point" 2>/dev/null || true
-                    break
-                fi
-            done
-        fi
-        
-        # If still read-only, try chntpw method (modify SAM directly)
-        if [ "$is_ro" = true ] && command -v chntpw &> /dev/null; then
-            echo "[DD Password] Filesystem read-only, using chntpw to modify SAM database..."
-            # Copy SAM and SYSTEM files
-            local sam_file="$mount_point/Windows/System32/config/SAM"
-            local system_file="$mount_point/Windows/System32/config/SYSTEM"
-            if [ -f "$sam_file" ] && [ -f "$system_file" ]; then
-                local temp_dir="/tmp/sam_modify_$$"
-                mkdir -p "$temp_dir"
-                # Copy files (read-only mount allows read)
-                cp "$sam_file" "$temp_dir/SAM" 2>/dev/null
-                cp "$system_file" "$temp_dir/SYSTEM" 2>/dev/null
-                
-                if [ -f "$temp_dir/SAM" ]; then
-                    echo "[DD Password] Modifying SAM database with chntpw..."
-                    # Use chntpw to set password
-                    # Method: Set password hash directly
-                    echo -e "1\n$password\n$password\nq\ny" | chntpw -u Administrator "$temp_dir/SAM" 2>/dev/null || {
-                        echo "[DD Password] chntpw method failed, will try startup script method"
-                    }
-                    
-                    # Copy back (need write access for this)
-                    # Since we can't write, we'll use startup script method instead
-                    rm -rf "$temp_dir"
-                fi
-            fi
-        fi
-        
-        # Try to create startup script (preferred method)
-        if [ "$mounted" = true ]; then
-            local script_created=false
-            # Try to create directory and script
-            if mkdir -p "$mount_point/Windows/Setup/Scripts" 2>/dev/null; then
-                # Create password reset script
-                cat > "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd" <<'EOF'
-@echo off
-timeout /t 60 /nobreak >nul
-net user Administrator "PASSWORD_PLACEHOLDER" >nul 2>&1
-net user Administrator /active:yes >nul 2>&1
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul 2>&1
-del "%~f0" >nul 2>&1
-EOF
-                # Replace password placeholder
-                if sed -i "s/PASSWORD_PLACEHOLDER/$password/g" "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd" 2>/dev/null; then
-                    script_created=true
-                    echo "[DD Password] Startup script created successfully!"
-                fi
-            fi
-            
-            # If script creation failed, try alternative locations
-            if [ "$script_created" = false ]; then
-                echo "[DD Password] Cannot create script in Setup/Scripts, trying alternative methods..."
-                
-                # Method 1: Try to create in alternative startup location (read-only won't work, but try)
-                local alt_locations=(
-                    "$mount_point/Windows/Temp/setup_pass.cmd"
-                    "$mount_point/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp/setup_pass.cmd"
-                )
-                
-                for alt_loc in "${alt_locations[@]}"; do
-                    local alt_dir=$(dirname "$alt_loc")
-                    if mkdir -p "$alt_dir" 2>/dev/null; then
-                        cat > "$alt_loc" <<EOF
-@echo off
-timeout /t 90 /nobreak >nul
-net user Administrator "$password" >nul 2>&1
-net user Administrator /active:yes >nul 2>&1
-del "%~f0" >nul 2>&1
-EOF
-                        if [ -f "$alt_loc" ]; then
-                            script_created=true
-                            echo "[DD Password] Created script in alternative location: $alt_loc"
-                            break
-                        fi
-                    fi
-                done
-            fi
-            
-            # If still failed and filesystem is read-only, we need to modify image differently
-            if [ "$script_created" = false ] && mount | grep -q "$mount_point.*ro,"; then
-                echo "[DD Password] Warning: Cannot create startup script (read-only filesystem)"
-                echo "[DD Password] Attempting to modify image file directly..."
-                # Unmount to modify image
-                umount "$mount_point" 2>/dev/null
-                mounted=false
-                # Will try to remount and inject at block level or use other method
-            fi
-            
-            if [ "$script_created" = true ]; then
-                sync
-                umount "$mount_point" 2>/dev/null || true
-                echo "[DD Password] Password modification completed successfully!"
-                mounted=false  # Mark as done
-            fi
-        fi
-    fi
-    
-    # If mount failed or script creation failed, try to create new modified image
-    if [ "$mounted" = false ] && [ -n "$temp_img" ] && [ -f "$temp_img" ]; then
-        echo "[DD Password] Trying alternative method: Re-extract and modify image..."
-        
-        # Unmount everything first
-        umount "$mount_point" 2>/dev/null || true
-        kpartx -d "$loop_dev" >/dev/null 2>&1 || true
-        losetup -d "$loop_dev" >/dev/null 2>&1 || true
-        
-        # Try mounting with more aggressive options
-        local retry_count=0
-        local max_retries=3
-        
-        while [ "$retry_count" -lt "$max_retries" ] && [ "$mounted" = false ]; do
-            retry_count=$((retry_count + 1))
-            echo "[DD Password] Retry $retry_count/$max_retries: Attempting to mount with write access..."
-            
-            # Setup loop device again
-            loop_dev=$(losetup -f --show "$temp_img" 2>/dev/null) || break
-            kpartx -av "$loop_dev" >/dev/null 2>&1
-            
-            # Wait a bit for partitions to be available
-            sleep 2
-            
-            # Try to find and mount partition with various methods
-            for part in /dev/mapper/$(basename $loop_dev)*; do
-                [ -b "$part" ] || continue
-                
-                # Method 1: Try with remove_hiberfile and force
-                if mount -t ntfs-3g -o rw,remove_hiberfile,force,noatime "$part" "$mount_point" 2>/dev/null; then
-                    if [ -d "$mount_point/Windows/System32" ]; then
-                        mounted=true
-                        echo "[DD Password] Successfully mounted with write access (method: remove_hiberfile,force)"
-                        break
-                    fi
-                    umount "$mount_point" 2>/dev/null
-                fi
-                
-                # Method 2: Try with streams_interface=windows
-                if mount -t ntfs-3g -o rw,remove_hiberfile,streams_interface=windows "$part" "$mount_point" 2>/dev/null; then
-                    if [ -d "$mount_point/Windows/System32" ]; then
-                        mounted=true
-                        echo "[DD Password] Successfully mounted with write access (method: streams_interface)"
-                        break
-                    fi
-                    umount "$mount_point" 2>/dev/null
-                fi
-                
-                # Method 3: Try with recover and no_def_opts
-                if mount -t ntfs-3g -o rw,remove_hiberfile,recover,no_def_opts "$part" "$mount_point" 2>/dev/null; then
-                    if [ -d "$mount_point/Windows/System32" ]; then
-                        mounted=true
-                        echo "[DD Password] Successfully mounted with write access (method: recover)"
-                        break
-                    fi
-                    umount "$mount_point" 2>/dev/null
-                fi
-            done
-            
-            if [ "$mounted" = true ]; then
-                # Try to create script now
-                if mkdir -p "$mount_point/Windows/Setup/Scripts" 2>/dev/null; then
-                    cat > "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd" <<'EOF'
-@echo off
-timeout /t 60 /nobreak >nul
-net user Administrator "PASSWORD_PLACEHOLDER" >nul 2>&1
-net user Administrator /active:yes >nul 2>&1
-reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul 2>&1
-del "%~f0" >nul 2>&1
-EOF
-                    if sed -i "s/PASSWORD_PLACEHOLDER/$password/g" "$mount_point/Windows/Setup/Scripts/setupcomplete.cmd" 2>/dev/null; then
-                        sync
-                        umount "$mount_point" 2>/dev/null || true
-                        echo "[DD Password] Password script injected successfully after retry!"
-                        kpartx -d "$loop_dev" >/dev/null 2>&1 || true
-                        losetup -d "$loop_dev" >/dev/null 2>&1 || true
-                        return 0
-                    fi
-                fi
-            else
-                # Cleanup before retry
-                kpartx -d "$loop_dev" >/dev/null 2>&1 || true
-                losetup -d "$loop_dev" >/dev/null 2>&1 || true
-                sleep 1
-            fi
-        done
-        
-        # Final cleanup
-        umount "$mount_point" 2>/dev/null || true
-        kpartx -d "$loop_dev" >/dev/null 2>&1 || true
-        losetup -d "$loop_dev" >/dev/null 2>&1 || true
-        
-        if [ "$mounted" = false ]; then
-            echo "[DD Password] Error: All mount attempts failed (read-only filesystem)"
-            echo "[DD Password] Note: Password will need to be reset manually after Windows boots"
-            return 1
-        fi
-    fi
-    
-    if [ "$mounted" = true ]; then
-        umount "$mount_point" 2>/dev/null || true
-    fi
-    
-    # Cleanup
-    kpartx -d "$loop_dev" >/dev/null 2>&1
-    losetup -d "$loop_dev" >/dev/null 2>&1
-    rmdir "$mount_point" 2>/dev/null
-    if [ "$need_cleanup" = true ]; then
-        # Remove extracted image
-        rm -f "$temp_img"
-        # If we downloaded from URL, also remove the downloaded .gz file
-        if [ -n "$downloaded_file" ] && [ -f "$downloaded_file" ]; then
-            rm -f "$downloaded_file"
-        fi
-    fi
+    # Password will be passed to trans.sh via extra_password parameter
+    # trans.sh will inject startup script to Windows after DD write
+    # No need to modify image file - we'll inject after DD write to disk
+    return 0
 }
 
 show_dd_password_tips() {
@@ -3361,7 +3036,7 @@ build_extra_cmdline() {
     # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/lib/debian-installer-startup.d/S02module-params?ref_type=heads
     for key in confhome hold force_boot_mode force_cn force_old_windows_setup cloud_image main_disk \
         elts deb_mirror \
-        ssh_port rdp_port web_port allow_ping; do
+        ssh_port rdp_port web_port allow_ping password; do
         value=${!key}
         if [ -n "$value" ]; then
             is_need_quote "$value" &&
@@ -4617,15 +4292,11 @@ else
     setos nextos alpine $alpine_ver_for_trans
 fi
 
-# Modify Windows password for DD mode if password provided
-# Skip if modify fails (will use alternative method after install)
-if is_use_dd && [ -n "$password" ] && [ -n "$img" ]; then
-    info "Modifying Windows password in DD image..."
-    if ! modify_windows_password_dd "$img" "$password"; then
-        warn "Failed to modify password in image. Password will need to be reset manually after Windows boots."
-        warn "You can reset password via VNC/Console after installation completes."
-        warn "Or wait for Windows to boot and use the default password from the image."
-    fi
+# Password for DD mode will be injected via trans.sh after DD write
+# No need to modify image file - saves disk space and avoids "no space left" errors
+if is_use_dd && [ -n "$password" ]; then
+    info "Password will be set automatically after Windows first boot via startup script"
+    info "Password parameter passed to trans.sh for injection after DD write"
 fi
 
 # 删除之前的条目
